@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.venv
+venv/
+dist/
+build/
+*.egg
+
+# Results (track structure, not raw data)
+results/*.csv
+results/*.json
+
+# Modal
+.modal/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model weights (never commit these)
+*.bin
+*.safetensors
+*.pt
+*.pth

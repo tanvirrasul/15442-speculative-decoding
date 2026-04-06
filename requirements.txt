@@ -1,0 +1,14 @@
+torch>=2.2.0
+transformers>=4.40.0
+accelerate>=0.29.0
+datasets>=2.18.0
+modal>=0.62.0
+numpy>=1.26.0
+pandas>=2.2.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+tqdm>=4.66.0
+nltk>=3.8.0          # for n-gram draft model
+human-eval>=1.0.0    # HumanEval dataset
+evaluate>=0.4.0
+sentencepiece>=0.2.0
