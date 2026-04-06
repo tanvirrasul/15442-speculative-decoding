@@ -45,15 +45,16 @@ def load_models(
     device: str = "cuda",
 ):
     tokenizer = AutoTokenizer.from_pretrained(target_model_id)
+    dtype = torch.float16 if device == "cuda" else torch.float32
 
     target_model = AutoModelForCausalLM.from_pretrained(
         target_model_id,
-        torch_dtype=torch.float16,
+        torch_dtype=dtype,
         device_map=device,
     )
     draft_model = AutoModelForCausalLM.from_pretrained(
         draft_model_id,
-        torch_dtype=torch.float16,
+        torch_dtype=dtype,
         device_map=device,
     )
     target_model.eval()
@@ -165,19 +166,22 @@ def run_speculative(
     # Warm up
     _ = target_model(inputs["input_ids"])
     _ = draft_model(inputs["input_ids"])
-    torch.cuda.synchronize()
+    if device == "cuda":
+        torch.cuda.synchronize()
 
     start = time.perf_counter()
     output_ids, stats = speculative_decode(
         target_model, draft_model, inputs["input_ids"], config, device
     )
-    torch.cuda.synchronize()
+    if device == "cuda":
+        torch.cuda.synchronize()
     end = time.perf_counter()
 
     # TTFT: time for target model single forward pass
     t0 = time.perf_counter()
     _ = target_model(inputs["input_ids"])
-    torch.cuda.synchronize()
+    if device == "cuda":
+        torch.cuda.synchronize()
     ttft = time.perf_counter() - t0
 
     total_time = end - start

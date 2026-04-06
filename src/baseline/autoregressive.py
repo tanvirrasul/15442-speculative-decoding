@@ -22,9 +22,10 @@ class BaselineResult:
 
 def load_model(model_id: str, device: str = "cuda"):
     tokenizer = AutoTokenizer.from_pretrained(model_id)
+    dtype = torch.float16 if device == "cuda" else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=torch.float16,
+        torch_dtype=dtype,
         device_map=device,
     )
     model.eval()
@@ -38,31 +39,31 @@ def run_baseline(
     max_new_tokens: int = 256,
     device: str = "cuda",
 ) -> BaselineResult:
+    def sync():
+        if device == "cuda":
+            torch.cuda.synchronize()
+
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     input_len = inputs["input_ids"].shape[1]
 
-    # Warm up
     with torch.no_grad():
         _ = model(**inputs)
-    torch.cuda.synchronize()
+    sync()
 
     start = time.perf_counter()
-    first_token_time = None
-
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
         )
-    torch.cuda.synchronize()
+    sync()
     end = time.perf_counter()
 
-    # Approximate TTFT as time for 1 token generation
     with torch.no_grad():
         t0 = time.perf_counter()
         _ = model.generate(**inputs, max_new_tokens=1, do_sample=False)
-        torch.cuda.synchronize()
+        sync()
         first_token_time = time.perf_counter() - t0
 
     total_time = end - start
