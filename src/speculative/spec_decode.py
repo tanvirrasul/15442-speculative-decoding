@@ -40,6 +40,7 @@ class SpecDecodingConfig:
     temperature: float = 1.0
     max_new_tokens: int = 256
     verbose_timing: bool = False
+    max_sequence_length: int = 1536  # safety cap to prevent OOM on long sequences
 
 
 def load_models(
@@ -65,14 +66,20 @@ def load_models(
     return target_model, draft_model, tokenizer
 
 
+def _safe_softmax(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    """Softmax with NaN/inf guards for numerical stability."""
+    logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+    return F.softmax(logits / max(temperature, 1e-8), dim=-1)
+
+
 def _sample(probs: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
     """
     Sample a token. Input: [1, vocab_size]. Output: [1, 1].
-    If temperature == 0.0, use greedy (argmax) instead of multinomial.
+    If temperature == 0.0, use greedy (argmax).
     """
     if temperature == 0.0:
-        return probs.argmax(dim=-1, keepdim=True)  # [1, 1]
-    return torch.multinomial(probs, num_samples=1)  # [1, 1]
+        return probs.argmax(dim=-1, keepdim=True)
+    return torch.multinomial(probs, num_samples=1)
 
 
 def _sync(device: str):
@@ -105,6 +112,10 @@ def speculative_decode(
 
         while generated.shape[1] - input_ids.shape[1] < config.max_new_tokens:
 
+            # Safety cap: prevent OOM from excessively long sequences
+            if generated.shape[1] >= config.max_sequence_length:
+                break
+
             # --- Draft phase: propose gamma tokens using KV cache ---
             t_draft_start = time.perf_counter()
             draft_probs = []
@@ -121,14 +132,12 @@ def speculative_decode(
                 logits = out.logits[:, -1, :]  # [1, vocab_size]
 
                 if config.temperature == 0.0:
-                    # Greedy: sharp distribution centered on argmax
-                    next_token = logits.argmax(dim=-1, keepdim=True)  # [1, 1]
-                    # Build a one-hot prob vector for acceptance check
+                    next_token = logits.argmax(dim=-1, keepdim=True)
                     probs = torch.zeros_like(logits)
                     probs.scatter_(1, next_token, 1.0)
                 else:
-                    probs = F.softmax(logits / config.temperature, dim=-1)
-                    next_token = _sample(probs, config.temperature)  # [1, 1]
+                    probs = _safe_softmax(logits, config.temperature)
+                    next_token = _sample(probs, config.temperature)
 
                 draft_probs.append(probs)
                 draft_tokens.append(next_token)
@@ -142,7 +151,7 @@ def speculative_decode(
             # Assemble draft sequence
             t_overhead_start = time.perf_counter()
             draft_token_tensor = torch.cat(draft_tokens, dim=1)  # [1, gamma]
-            draft_ids = torch.cat([generated, draft_token_tensor], dim=1)  # [1, seq+gamma]
+            draft_ids = torch.cat([generated, draft_token_tensor], dim=1)
             total_overhead_time += time.perf_counter() - t_overhead_start
 
             # --- Verify phase: single target forward pass ---
@@ -158,17 +167,17 @@ def speculative_decode(
                 :,
                 generated.shape[1] - 1: generated.shape[1] + config.gamma - 1,
                 :
-            ]  # [1, gamma, vocab_size]
+            ]
 
             if config.temperature == 0.0:
-                # Greedy target: one-hot at argmax
                 target_probs_all = torch.zeros_like(target_logits)
-                argmax_ids = target_logits.argmax(dim=-1, keepdim=True)  # [1, gamma, 1]
+                argmax_ids = target_logits.argmax(dim=-1, keepdim=True)
                 target_probs_all.scatter_(2, argmax_ids, 1.0)
             else:
-                target_probs_all = F.softmax(
-                    target_logits / config.temperature, dim=-1
-                )
+                target_probs_all = torch.stack([
+                    _safe_softmax(target_logits[:, i, :], config.temperature)
+                    for i in range(config.gamma)
+                ], dim=1)
 
             # --- Acceptance / rejection ---
             accepted_count = 0
@@ -180,7 +189,6 @@ def speculative_decode(
                 q = draft_probs[i][0, token_idx]
 
                 if config.temperature == 0.0:
-                    # Greedy: accept iff both models agree on the same token
                     accepted = (p.item() == 1.0)
                 else:
                     acceptance_prob = torch.clamp(p / (q + 1e-8), max=1.0)
@@ -192,12 +200,15 @@ def speculative_decode(
                 else:
                     rejected_at = i
                     if config.temperature == 0.0:
-                        # Greedy: take target's argmax at this position
                         resampled = target_logits[0, i].argmax(dim=-1).reshape(1, 1)
                     else:
                         corrected = torch.clamp(
                             target_probs_all[0, i, :] - draft_probs[i][0, :], min=0
                         )
+                        corrected = corrected / (corrected.sum() + 1e-8)
+                        corrected = torch.nan_to_num(corrected, nan=0.0)
+                        if corrected.sum() < 1e-8:
+                            corrected = target_probs_all[0, i, :]
                         corrected = corrected / (corrected.sum() + 1e-8)
                         resampled = torch.multinomial(
                             corrected.unsqueeze(0), num_samples=1
@@ -214,9 +225,7 @@ def speculative_decode(
                 if config.temperature == 0.0:
                     bonus_token = bonus_logits.argmax(dim=-1, keepdim=True)
                 else:
-                    bonus_probs = F.softmax(
-                        bonus_logits / config.temperature, dim=-1
-                    )
+                    bonus_probs = _safe_softmax(bonus_logits, config.temperature)
                     bonus_token = _sample(bonus_probs, config.temperature)
                 generated = torch.cat(
                     [generated, draft_token_tensor, bonus_token], dim=1
@@ -228,7 +237,7 @@ def speculative_decode(
             # --- KV cache update ---
             t_draft_start = time.perf_counter()
             if rejected_at is None:
-                # All accepted: just append bonus token to existing cache
+                # All accepted: just feed bonus token to update cache
                 draft_out = draft_model(
                     bonus_token,
                     past_key_values=current_past_kv,
@@ -236,7 +245,7 @@ def speculative_decode(
                 )
                 draft_past_kv = draft_out.past_key_values
             else:
-                # Rejected: full reprocess (unavoidable)
+                # Rejection: full reprocess of current sequence
                 draft_out = draft_model(generated, use_cache=True)
                 draft_past_kv = draft_out.past_key_values
             _sync(device)
@@ -282,7 +291,6 @@ def run_speculative(
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
     input_len = inputs["input_ids"].shape[1]
 
-    # Warm up
     with torch.no_grad():
         _ = target_model(inputs["input_ids"])
         _ = draft_model(inputs["input_ids"])
